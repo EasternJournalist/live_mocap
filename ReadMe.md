@@ -2,6 +2,8 @@
 
 *TODO*
 
+![Ganyu-ji](images/ganyu_ji.gif)
+
 ## Requirements
 
 python>=3.8
