@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from utils3d import euler_angles_to_matrix, mls_smooth
+from utils3d import euler_angle_to_matrix, mls_smooth
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from skeleton_config import load_skeleton_data, get_optimization_target, get_constraints, get_align_location, get_align_scale, MEDIAPIPE_KEYPOINTS_WITH_HANDS, MEDIAPIPE_KEYPOINTS_WITHOUT_HANDS
@@ -32,7 +32,7 @@ def eval_matrix_world(parents: torch.Tensor, matrix_bones: torch.Tensor, matrix_
 
 class EvalMatrixWorld(torch.autograd.Function):
     """
-    Call c++ function to evaluate matrix_world, for speed. Second order derivative is not supported.
+    Call c++ function to evaluate matrix_world
     """
 
     cdll = ctypes.CDLL(os.path.join(os.path.dirname(__file__), 'cpp_eval_bone_matrix/cpp_eval_bone_matrix.dll'))
@@ -78,7 +78,7 @@ class EvalMatrixWorld(torch.autograd.Function):
 eval_matrix_world = EvalMatrixWorld.apply
 
 
-class SkeletonIKSovler:
+class SkeletonIKSolver:
     def __init__(self, model_path: str, track_hands: bool = True, **kwargs):
         # load skeleton model data
         all_bone_names, all_bone_parents, all_bone_matrix_world_rest, all_bone_matrix, skeleton_remap = load_skeleton_data(model_path)
@@ -105,7 +105,7 @@ class SkeletonIKSovler:
         self.joint_constraints_min, self.joint_constraints_max = joint_constraint_value[:, :, 0], joint_constraint_value[:, :, 1]
 
         # align location
-        self.align_location_kpts, self.align_location_bones = get_align_location(all_bone_names, skeleton_remap)
+        self.align_location_kpts, self.align_location_bones = get_align_location(optimizable_bones, skeleton_remap)
 
         # align scale
         self.align_scale_pairs_kpt, self.align_scale_pairs_bone = get_align_scale(all_bone_names, skeleton_remap)
@@ -117,9 +117,9 @@ class SkeletonIKSovler:
         self.max_iter = kwargs.get('max_iter', 24)
         self.tolerance_change = kwargs.get('tolerance_change', 1e-6)
         self.tolerance_grad = kwargs.get('tolerance_grad', 1e-4)
-        self.joint_constraint_loss_weight = kwargs.get('joint_constraint_loss_weight', 0.1)
-        self.pose_reg_loss_weight = kwargs.get('pose_reg_loss_weight', 0.01)
-        self.smooth_steps = kwargs.get('smooth_steps', 12)
+        self.joint_constraint_loss_weight = kwargs.get('joint_constraint_loss_weight', 1)
+        self.pose_reg_loss_weight = kwargs.get('pose_reg_loss_weight', 0.1)
+        self.smooth_range = kwargs.get('smooth_range', 0.3)
 
         # optimizable bone euler angles
         self.optimizable_bones = optimizable_bones
@@ -128,24 +128,15 @@ class SkeletonIKSovler:
         self.optim_bone_euler = torch.zeros((len(optimizable_bones), 3), requires_grad=True)
 
         # smoothness
-        self.joint_trace = []
-        # self.kpts_trace = []
-        self.align_location = torch.zeros(3)
+        self.euler_angle_history, self.location_history = [], []
         self.align_scale = torch.tensor(0.0)
 
-    def fit(self, kpts: torch.Tensor, valid: torch.Tensor):
-        # smooth keypoints
-        # self.kpts_trace.append(kpts)
-        # if len(self.kpts_trace) > self.smooth_steps:
-        #     self.kpts_trace.pop(0)
-        # kpts_sm = self.kpts_trace[-1] if len(self.kpts_trace) <= 3 else mls_smooth(self.kpts_trace)
-        self.align_location = kpts[self.align_location_kpts].mean(dim=0)
-
+    def fit(self, kpts: torch.Tensor, valid: torch.Tensor, frame_t: float):
         optimizer = torch.optim.LBFGS(
             [self.optim_bone_euler], 
             line_search_fn='strong_wolfe', 
             lr=self.lr, 
-            max_iter=100 if len(self.joint_trace) == 0 else self.max_iter, 
+            max_iter=100 if len(self.euler_angle_history) == 0 else self.max_iter, 
             tolerance_change=self.tolerance_change, 
             tolerance_grad=self.tolerance_grad
         )
@@ -163,7 +154,7 @@ class SkeletonIKSovler:
 
         def _loss_closure():
             optimizer.zero_grad()
-            optim_matrix_basis = euler_angles_to_matrix(self.optim_bone_euler, 'YXZ')
+            optim_matrix_basis = euler_angle_to_matrix(self.optim_bone_euler, 'YXZ')
             matrix_basis = torch.gather(torch.cat([torch.eye(4).unsqueeze(0), optim_matrix_basis]), dim=0, index=self.gather_id)
             matrix_world = eval_matrix_world(self.bone_parents_id, self.bone_matrix, matrix_basis)
             joints = matrix_world[:, :3, 3]
@@ -177,25 +168,42 @@ class SkeletonIKSovler:
 
         if len(kpt_dir) > 0:
             optimizer.step(_loss_closure)
-        self.joint_trace.append(self.optim_bone_euler.detach().clone())
-        if len(self.joint_trace) > self.smooth_steps:
-            self.joint_trace.pop(0)
 
-    def get_bone_euler(self) -> torch.Tensor:
-        joints_smoothed = self.joint_trace[-1] if len(self.joint_trace) <= 3 else mls_smooth(self.joint_trace)
+        optim_matrix_basis = euler_angle_to_matrix(self.optim_bone_euler, 'YXZ')
+        matrix_basis = torch.gather(torch.cat([torch.eye(4).unsqueeze(0), optim_matrix_basis]), dim=0, index=self.all_gather_id)
+        matrix_world = torch.tensor([align_scale, align_scale, align_scale, 1.])[None, :, None] * eval_matrix_world(self.bone_parents_id, self.bone_matrix, matrix_basis)
+        location = kpts[self.align_location_kpts].mean(dim=0) - matrix_world[self.align_location_bones, :3, 3].mean(dim=0)
+
+        self.euler_angle_history.append((self.optim_bone_euler.detach().clone(), frame_t))
+        self.location_history.append((location, frame_t))
+
+    def get_smoothed_bone_euler(self, query_t: float) -> torch.Tensor:
+        input_euler, input_t = zip(*((e, t) for e, t in self.euler_angle_history if abs(t - query_t) < self.smooth_range))
+        if len(input_t) <= 2:
+            joints_smoothed = input_euler[-1]
+        else:
+            joints_smoothed = mls_smooth(input_t, input_euler, query_t, self.smooth_range)
         return joints_smoothed
     
     def get_scale(self) -> float:
         return self.align_scale
 
-    def get_bone_matrix_world(self) -> torch.Tensor:
-        optim_matrix_basis = euler_angles_to_matrix(self.get_bone_euler(), 'YXZ')
+    def get_smoothed_location(self, query_t: float) -> torch.Tensor:
+        input_location, input_t = zip(*((e, t) for e, t in self.location_history if abs(t - query_t) < self.smooth_range))
+        if len(input_t) <= 2:
+            location_smoothed = input_location[-1]
+        else:
+            location_smoothed = mls_smooth(input_t, input_location, query_t, self.smooth_range)
+        return location_smoothed
+
+    def eval_bone_matrix_world(self, bone_euler: torch.Tensor, location: torch.Tensor, scale: float) -> torch.Tensor:
+        optim_matrix_basis = euler_angle_to_matrix(bone_euler, 'YXZ')
         matrix_basis = torch.gather(torch.cat([torch.eye(4).unsqueeze(0), optim_matrix_basis]), dim=0, index=self.all_gather_id)
         matrix_world = eval_matrix_world(self.all_bone_parents_id, self.all_bone_matrix, matrix_basis)
 
-        # align scale and location
-        matrix_world = torch.tensor([self.align_scale, self.align_scale, self.align_scale, 1.])[None, :, None] * matrix_world
-        matrix_world[:, :3, 3] += self.align_location - matrix_world[self.align_location_bones, :3, 3].mean(dim=0)
+        # set scale and location
+        matrix_world = torch.tensor([scale, scale, scale, 1.])[None, :, None] * matrix_world
+        matrix_world[:, :3, 3] += location
         return matrix_world
 
 
@@ -218,7 +226,16 @@ def update_eval_matrix(bone_parents: torch.Tensor, bone_matrix_world: torch.Tens
 def test():
     import tqdm
 
-    solver = SkeletonIKSovler('D:\\projects\\morphing/avatar/wei/', track_hands=True)
+    solver = SkeletonIKSolver(
+        'D:\\projects\\morphing/avatar/girl_1219/', 
+        track_hands=False,
+        max_iter = 16,
+        tolerance_change = 1e-6,
+        tolerance_grad = 1e-4,
+        joint_constraint_loss_weight = 1e-1,
+        pose_reg_loss_weight = 1e-2,   
+        smooth_range = 0.3 
+    )
     with open('tmp/kpts3ds_mengnan.pkl', 'rb') as f:
         body_keypoints = pickle.load(f)
 

@@ -37,7 +37,7 @@ OPTIMIZABLE_BONES = [
 ]
 
 
-ALIGN_LOCATION_WITH = ['left_ankle', 'right_ankle']
+ALIGN_LOCATION_WITH = ['left_shoulder', 'right_shoulder']
 ALIGN_SCALE_WITH = [('left_shoulder', 'right_shoulder'), ('left_hip', 'right_hip'), ('left_shoulder', 'left_hip'),  ('right_shoulder', 'right_hip')]
 
 TARGET_KEYPOINT_PAIRS_WITH_HANDS = [

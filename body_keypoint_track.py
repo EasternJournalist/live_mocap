@@ -50,36 +50,33 @@ WEIGHTS = {
     'right_ankle': 0.02,
 }
 
-class BodyKeypointsTrack:
-    def __init__(self, im_width: int, im_height: int, fov: float, *, track_hands: bool = True, smooth_range: float = 0.3, smooth_range_barycenter: float = 1.0, frame_delta: float = 1/30):
+class BodyKeypointTrack:
+    def __init__(self, im_width: int, im_height: int, fov: float, frame_rate: float, *, track_hands: bool = True, model_complexity=1, smooth_range: float = 0.3, smooth_range_barycenter: float = 1.0):
         self.K = intrinsic_from_fov(fov, im_width, im_height)
         self.im_width, self.im_height = im_width, im_height
-        self.frame_delta = frame_delta
+        self.frame_delta = 1. / frame_rate
 
         self.mp_pose_model = mp.solutions.pose.Pose(
-            model_complexity=2, 
+            model_complexity=model_complexity, 
             min_detection_confidence=0.5, 
-            min_tracking_confidence=0.2
+            min_tracking_confidence=0.5
         )
         self.pose_rvec, self.pose_tvec = None, None
-        self.pose_kpts2d = np.zeros((33, 2))
-        self.pose_kpts3d = np.zeros((33, 3))
+        self.pose_kpts2d = self.pose_kpts3d = None
         self.barycenter_weight = np.array([WEIGHTS.get(kp, 0.) for kp in MEDIAPIPE_POSE_KEYPOINTS])
 
         self.track_hands = track_hands
         if track_hands:
             self.mp_hands_model = mp.solutions.hands.Hands(
                 max_num_hands=2,
-                model_complexity=1, 
+                model_complexity=min(model_complexity, 1), 
                 min_detection_confidence=0.5, 
                 min_tracking_confidence=0.5
             )
             self.left_hand_rvec, self.left_hand_tvec = None, None
-            self.left_hand_kpts2d = np.zeros((21, 2))
-            self.left_hand_kpts3d = np.zeros((21, 3))
+            self.left_hand_kpts2d = self.left_hand_kpts3d = None
             self.right_hand_rvec, self.right_hand_tvec = None, None
-            self.right_hand_kpts2d = np.zeros((21, 2))
-            self.right_hand_kpts3d = np.zeros((21, 3))
+            self.right_hand_kpts2d = self.right_hand_kpts3d = None
         
         self.smooth_range = smooth_range
         self.smooth_range_barycenter = smooth_range_barycenter
@@ -88,9 +85,9 @@ class BodyKeypointsTrack:
         self.left_hand_history: List[Tuple[np.ndarray, float]] = []
         self.right_hand_history: List[Tuple[np.ndarray, float]] = []
 
-    def _get_camera_space_landmarks(self, image_landmarks, world_landmarks, rvec, tvec):
+    def _get_camera_space_landmarks(self, image_landmarks, world_landmarks, visible, rvec, tvec):
         # get transformation matrix from world coordinate to camera coordinate
-        _, rvec, tvec = cv2.solvePnP(world_landmarks, image_landmarks, self.K, np.zeros(5), rvec=rvec, tvec=tvec, useExtrinsicGuess=rvec is not None)
+        _, rvec, tvec = cv2.solvePnP(world_landmarks[visible], image_landmarks[visible], self.K, np.zeros(5), rvec=rvec, tvec=tvec, useExtrinsicGuess=rvec is not None)
         rmat, _ = cv2.Rodrigues(rvec)
         
         # get camera coordinate of all keypoints
@@ -102,17 +99,22 @@ class BodyKeypointsTrack:
         return kpts3d_cam, rvec, tvec
 
     def _track_pose(self, image: np.ndarray, t: float):
+        self.pose_kpts2d = self.pose_kpts3d = self.barycenter = None
+
         results = self.mp_pose_model.process(image)
 
         if results.pose_landmarks is None:
-            return False
+            return 
 
         image_landmarks = np.array([[lm.x * self.im_width, lm.y * self.im_height] for lm in results.pose_landmarks.landmark])
         world_landmarks = np.array([[lm.x, lm.y, lm.z] for lm in results.pose_world_landmarks.landmark])
+        visible = np.array([lm.visibility > 0.2 for lm in results.pose_landmarks.landmark])
 
-        kpts3d, rvec, tvec = self._get_camera_space_landmarks(image_landmarks, world_landmarks, self.pose_rvec, self.pose_tvec)
+        if visible.sum() < 6:
+            return 
+        kpts3d, rvec, tvec = self._get_camera_space_landmarks(image_landmarks, world_landmarks, visible, self.pose_rvec, self.pose_tvec)
         if tvec[2] < 0:
-            return False
+            return
 
         self.pose_kpts2d = image_landmarks
         self.barycenter = np.average(kpts3d, axis=0, weights=self.barycenter_weight)
@@ -122,52 +124,54 @@ class BodyKeypointsTrack:
         self.pose_history.append((kpts3d, t))
 
     def _track_hands(self, image: np.ndarray, t: float):
+        self.left_hand_kpts2d = self.left_hand_kpts3d = None
+        self.right_hand_kpts2d = self.right_hand_kpts3d = None
+
         # run mediapipe hand estimation,
         results = self.mp_hands_model.process(image)
 
         # get left hand keypoints
         if results.multi_handedness is None:
-            return False, False
+            return
 
         num_hands_detected = len(results.multi_handedness)
 
-        left_hand_success = False
         left_hand_id = list(filter(lambda i: results.multi_handedness[i].classification[0].label == 'Right', range(num_hands_detected)))
         if len(left_hand_id) > 0:
             left_hand_id = left_hand_id[0]
 
             image_landmarks = np.array([[lm.x * self.im_width, lm.y * self.im_height] for lm in results.multi_hand_landmarks[left_hand_id].landmark])
             world_landmarks = np.array([[lm.x, lm.y, lm.z] for lm in results.multi_hand_world_landmarks[left_hand_id].landmark])
+            visible = np.array([lm.visibility > 0.2 for lm in results.multi_hand_landmarks[left_hand_id].landmark])
 
-            kpts3d, rvec, tvec = self._get_camera_space_landmarks(image_landmarks, world_landmarks, self.left_hand_rvec, self.left_hand_tvec)
-            if tvec[2] > 0:
-                self.left_hand_kpts2d = image_landmarks
-                self.left_hand_kpts3d = kpts3d + (self.pose_kpts3d[MEDIAPIPE_POSE_KEYPOINTS.index('left_wrist')] - kpts3d[MEDIAPIPE_HAND_KEYPOINTS.index('wrist')]).reshape(1, 3)
-                self.left_hand_rvec, self.left_hand_tvec = rvec, tvec
-                self.left_hand_history.append((self.left_hand_kpts3d, t))
+            if visible.sum() >= 6:
+                kpts3d, rvec, tvec = self._get_camera_space_landmarks(image_landmarks, world_landmarks, visible, self.left_hand_rvec, self.left_hand_tvec)
+                if tvec[2] > 0:
+                    self.left_hand_kpts2d = image_landmarks
+                    self.left_hand_kpts3d = kpts3d + (self.pose_kpts3d[MEDIAPIPE_POSE_KEYPOINTS.index('left_wrist')] - kpts3d[MEDIAPIPE_HAND_KEYPOINTS.index('wrist')]).reshape(1, 3)
+                    self.left_hand_rvec, self.left_hand_tvec = rvec, tvec
+                    self.left_hand_history.append((self.left_hand_kpts3d, t))
 
-        right_hand_success = False
         right_hand_id = list(filter(lambda i: results.multi_handedness[i].classification[0].label == 'Left', range(num_hands_detected)))
         if len(right_hand_id) > 0:
             right_hand_id = right_hand_id[0]
 
             image_landmarks = np.array([[lm.x * self.im_width, lm.y * self.im_height] for lm in results.multi_hand_landmarks[right_hand_id].landmark])
             world_landmarks = np.array([[lm.x, lm.y, lm.z] for lm in results.multi_hand_world_landmarks[right_hand_id].landmark])
+            visible = np.array([lm.visibility > 0.2 for lm in results.multi_hand_landmarks[right_hand_id].landmark])
 
-            kpts3d, rvec, tvec = self._get_camera_space_landmarks(image_landmarks, world_landmarks, self.right_hand_rvec, self.right_hand_tvec)
-            if tvec[2] > 0:
-                right_hand_success = True
-                self.right_hand_kpts2d = image_landmarks
-                self.right_hand_kpts3d = kpts3d + (self.pose_kpts3d[MEDIAPIPE_POSE_KEYPOINTS.index('right_wrist')] - kpts3d[MEDIAPIPE_HAND_KEYPOINTS.index('wrist')]).reshape(1, 3)
-                self.right_hand_rvec, self.right_hand_tvec = rvec, tvec
-                self.right_hand_history.append((self.right_hand_kpts3d, t))
-
-        return left_hand_success, right_hand_success
+            if visible.sum() >= 6:
+                kpts3d, rvec, tvec = self._get_camera_space_landmarks(image_landmarks, world_landmarks, visible, self.right_hand_rvec, self.right_hand_tvec)
+                if tvec[2] > 0:
+                    self.right_hand_kpts2d = image_landmarks
+                    self.right_hand_kpts3d = kpts3d + (self.pose_kpts3d[MEDIAPIPE_POSE_KEYPOINTS.index('right_wrist')] - kpts3d[MEDIAPIPE_HAND_KEYPOINTS.index('wrist')]).reshape(1, 3)
+                    self.right_hand_rvec, self.right_hand_tvec = rvec, tvec
+                    self.right_hand_history.append((self.right_hand_kpts3d, t))
 
     def track(self, image: np.ndarray, frame_t: float):
-        pose_success = self._track_pose(image, frame_t)
-        if self.track_hands:
-            left_hand_success, right_hand_success = self._track_hands(image, frame_t)
+        self._track_pose(image, frame_t)
+        if self.track_hands and self.pose_kpts3d is not None:
+            self._track_hands(image, frame_t)
 
     def get_smoothed_3d_keypoints(self, query_t: float):
         # Get smoothed barycenter
@@ -190,12 +194,18 @@ class BodyKeypointsTrack:
             # Get smoothed left hand keypoints
             left_hand_kpts3d_list = [kpts3d for kpts3d, t in self.left_hand_history if abs(t - query_t) < self.smooth_range]
             left_hand_t = [t for kpts3d, t in self.left_hand_history if abs(t - query_t) < self.smooth_range]
-            left_hand_kpts3d = None if not any(abs(t - query_t) < self.frame_delta * 0.6 for t in left_hand_t) else barycenter[None, :] + mls_smooth_numpy(left_hand_t, left_hand_kpts3d_list, query_t, self.smooth_range)
-
+            if any(abs(t - query_t) < self.frame_delta * 0.6 for t in left_hand_t):
+                left_hand_kpts3d = barycenter[None, :] + mls_smooth_numpy(left_hand_t, left_hand_kpts3d_list, query_t, self.smooth_range)
+            else:
+                left_hand_kpts3d = None
+                
             # Get smoothed right hand keypoints
             right_hand_kpts3d_list = [kpts3d for kpts3d, t in self.right_hand_history if abs(t - query_t) < self.smooth_range]
             right_hand_t = [t for kpts3d, t in self.right_hand_history if abs(t - query_t) < self.smooth_range]
-            right_hand_kpts3d = None if not any(abs(t - query_t) < self.frame_delta * 0.6 for t in right_hand_t) else barycenter[None, :] + mls_smooth_numpy(right_hand_t, right_hand_kpts3d_list, query_t, self.smooth_range)
+            if any(abs(t - query_t) < self.frame_delta * 0.6 for t in right_hand_t):
+                right_hand_kpts3d = barycenter[None, :] + mls_smooth_numpy(right_hand_t, right_hand_kpts3d_list, query_t, self.smooth_range)
+            else:
+                right_hand_kpts3d = None
             
             all_kpts3d = np.concatenate([
                 all_kpts3d,
@@ -211,18 +221,38 @@ class BodyKeypointsTrack:
         
         return all_kpts3d, all_valid
 
+    def get_2d_keypoints(self):
+        if self.track_hands:
+            return self.pose_kpts2d, self.left_hand_kpts2d, self.right_hand_kpts2d
+        else:
+            return self.pose_kpts2d
+
+def show_annotation(image, kpts3d, valid, intrinsic):
+    annotate_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    kpts3d_homo = kpts3d @ intrinsic.T
+    kpts2d = kpts3d_homo[:, :2] / kpts3d_homo[:, 2:]
+    for a, b in MEDIAPIPE_POSE_CONNECTIONS:
+        if valid[a] == 0 or valid[b] == 0:
+            continue
+        cv2.line(annotate_image, (int(kpts2d[a, 0]), int(kpts2d[a, 1])), (int(kpts2d[b, 0]), int(kpts2d[b, 1])), (0, 255, 0), 1)
+    for i in range(kpts2d.shape[0]):
+        if valid[i] == 0:
+            continue
+        cv2.circle(annotate_image, (int(kpts2d[i, 0]), int(kpts2d[i, 1])), 2, (0, 0, 255), -1)
+    cv2.imshow('Keypoint annotation', annotate_image)
+
 def test():
     import tqdm
 
-    INPUT_FILE = 'C:\\Users\\16215\\Pictures\\Camera Roll\\orange.mp4'
+    INPUT_FILE = 'C:\\Users\\16215\\Pictures\\视频项目\\orange.mp4'
     INPUT_IMAGE_SIZE = (640, 360)
     cap = cv2.VideoCapture(INPUT_FILE)
     kpts3ds = []
     
-    body_keypoints_track = BodyKeypointsTrack(
+    body_keypoint_track = BodyKeypointTrack(
         *INPUT_IMAGE_SIZE, 
         np.pi / 4, 
-        track_hands=True, 
+        track_hands=False, 
         smooth_range=0.3, 
         smooth_range_barycenter=1.0, 
         frame_delta=1.0 / 30.0
@@ -235,11 +265,11 @@ def test():
         if not ret:
             break
         frame = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), INPUT_IMAGE_SIZE)
-        body_keypoints_track.track(frame, frame_t)
-        kpts3d, visib = body_keypoints_track.get_smoothed_3d_keypoints(frame_t)
+        body_keypoint_track.track(frame, frame_t)
+        kpts3d, visib = body_keypoint_track.get_smoothed_3d_keypoints(frame_t)
         kpts3ds.append((kpts3d, visib))
 
-        kpts3d_homo = kpts3d @ body_keypoints_track.K.T
+        kpts3d_homo = kpts3d @ body_keypoint_track.K.T
         kpts2d = kpts3d_homo[:, :2] / kpts3d_homo[:, 2:]
 
         annotate_image = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)

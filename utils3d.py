@@ -47,7 +47,7 @@ def _axis_angle_rotation(axis: str, angle: torch.Tensor) -> torch.Tensor:
 
     return torch.stack(R_flat, -1).reshape(angle.shape + (4, 4))
 
-def euler_angles_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch.Tensor:
+def euler_angle_to_matrix(euler_angles: torch.Tensor, convention: str) -> torch.Tensor:
     """
     Code MODIFIED from pytorch3d
     Convert rotations given as Euler angles in radians to rotation matrices.
@@ -91,13 +91,16 @@ def moving_least_square(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor):
     a = a.squeeze(-1)
     return a
 
-def mls_smooth(trace: List[torch.Tensor]):
-    trace = torch.stack(trace, dim=-1)
-    broadcaster = (None,)*(len(trace.shape) - 1)
-    x = torch.linspace(0, 1, trace.shape[-1])[broadcaster]
-    w = torch.linspace(0, 1, trace.shape[-1])[broadcaster]
-    coef = moving_least_square(x, trace, w)
-    return torch.sum(coef, dim=-1)
+def mls_smooth(input_t: List[float], input_y: List[np.ndarray], query_t: float, smooth_range: float):
+    # 1-D MLS: input_t: (N), input_y: (..., N), query_t: scalar
+    if len(input_y) == 1:
+        return input_y[0]
+    input_t = torch.tensor(input_t) - query_t
+    input_y = torch.stack(input_y, axis=-1)
+    broadcaster = (None,)*(len(input_y.shape) - 1)
+    w = torch.maximum(smooth_range - torch.abs(input_t), torch.tensor(0))
+    coef = moving_least_square(input_t[broadcaster], input_y, w[broadcaster])
+    return coef[..., 0]
 
 def moving_least_square_numpy(x: np.ndarray, y: np.ndarray, w: np.ndarray):
     # 1-D MLS: x: (..., N), y: (..., N), w: (..., N)
