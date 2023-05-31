@@ -32,6 +32,8 @@
     python mocap.py --blend your_character_model.blend --video your_video.mp4 [other options] 
     ```
 
+    The program will read and capture motion from the video, save the animation data, and then open Blender and bind the animation to your charactor model. After everything is done, you should be able to see the Blender window with your character already animated.
+
 # Future work
 
 * Now working on face capture.
