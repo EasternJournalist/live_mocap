@@ -21,8 +21,8 @@
     
     * Clear previous bone animation data and constraints.
     
-    * Name related bones as below (in lower case). 
-    (Picture here)
+    * Name related bones as below (in lower case). You may refer the mixamo example [assets/mixamo.blend](assets/mixamo.blend) to see to name the bones so that they can be recogonzed and binded.
+    ![](images/mixamo.png)
 
     * Save the model as `.blend` file somewhere.
 
