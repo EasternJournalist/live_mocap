@@ -120,3 +120,32 @@ def mls_smooth_numpy(input_t: List[float], input_y: List[np.ndarray], query_t: f
     w = np.maximum(smooth_range - np.abs(input_t), 0)
     coef = moving_least_square_numpy(input_t[broadcaster], input_y, w[broadcaster])
     return coef[..., 0]
+
+
+import time
+
+class timeit:
+    def __init__(self, name: str = '', verbose: bool = True):
+        self.name = name
+        self.verbose = verbose
+    
+    @property
+    def elapsed(self):
+        return self.end - self.start
+
+    def __enter__(self):
+        self.start = time.time()
+        return self
+
+    def __exit__(self, *args):
+        self.end = time.time()
+        if self.verbose:
+            print(f'{self.name} time: {self.elapsed:.4f}s')
+    
+    def __call__(self, func: Callable):
+        self.name = func.__qualname__
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self:
+                return func(*args, **kwargs)
+        return wrappers
