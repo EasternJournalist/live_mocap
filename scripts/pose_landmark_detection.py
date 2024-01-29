@@ -1,51 +1,34 @@
 import time
 import threading
-from functools import partial
-import traceback
+import cv2
+import numpy as np
 from typing import *
 
-import numpy as np
-import cv2
 import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
+import numpy as np
+import cv2
 
 
 def draw_landmarks_on_image(rgb_image, detection_result):
-    face_landmarks_list = detection_result.face_landmarks
+    pose_landmarks_list = detection_result.pose_landmarks
     annotated_image = np.copy(rgb_image)
 
-    # Loop through the detected faces to visualize.
-    for idx in range(len(face_landmarks_list)):
-        face_landmarks = face_landmarks_list[idx]
+    # Loop through the detected poses to visualize.
+    for idx in range(len(pose_landmarks_list)):
+        pose_landmarks = pose_landmarks_list[idx]
 
-        # Draw the face landmarks.
-        face_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
-        face_landmarks_proto.landmark.extend([
-        landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y, z=landmark.z) for landmark in face_landmarks
+        # Draw the pose landmarks.
+        pose_landmarks_proto = landmark_pb2.NormalizedLandmarkList()
+        pose_landmarks_proto.landmark.extend([
+            landmark_pb2.NormalizedLandmark(x=landmark.x, y=landmark.y, z=landmark.z) for landmark in pose_landmarks
         ])
-
         mp.solutions.drawing_utils.draw_landmarks(
-            image=annotated_image,
-            landmark_list=face_landmarks_proto,
-            connections=mp.solutions.face_mesh.FACEMESH_TESSELATION,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=mp.solutions.drawing_styles
-            .get_default_face_mesh_tesselation_style())
-        mp.solutions.drawing_utils.draw_landmarks(
-            image=annotated_image,
-            landmark_list=face_landmarks_proto,
-            connections=mp.solutions.face_mesh.FACEMESH_CONTOURS,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=mp.solutions.drawing_styles
-            .get_default_face_mesh_contours_style())
-        mp.solutions.drawing_utils.draw_landmarks(
-            image=annotated_image,
-            landmark_list=face_landmarks_proto,
-            connections=mp.solutions.face_mesh.FACEMESH_IRISES,
-            landmark_drawing_spec=None,
-            connection_drawing_spec=mp.solutions.drawing_styles
-            .get_default_face_mesh_iris_connections_style())
-
+            annotated_image,
+            pose_landmarks_proto,
+            mp.solutions.pose.POSE_CONNECTIONS,
+            mp.solutions.drawing_styles.get_default_pose_landmarks_style()
+        )
     return annotated_image
 
 
@@ -73,14 +56,13 @@ def caputure_detect_thread_fn(
         
         _, frame = cap.retrieve()
         frames[idx] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results[idx] = detector.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=frame), int((frame_time - start_time) * 1000))
+        results[idx] = detector.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=frames[idx]), int((frame_time - start_time) * 1000))
+        # frames[idx] = draw_landmarks_on_image(frames[idx], results[idx])
         event_ready.set()
 
 
 if __name__ == '__main__':
-    # Create an FaceLandmarker object.
-    # !wget -O face_landmarker_v2_with_blendshapes.task -q https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
-    base_options = mp.tasks.BaseOptions(model_asset_path='./mediapipe-assets/face_landmarker_v2_with_blendshapes.task')
+    base_options = mp.tasks.BaseOptions(model_asset_path='./mediapipe-assets/pose_landmarker_lite.task')
 
     # Open video capture devices
     MAX_CAMERAS = 2
@@ -98,14 +80,12 @@ if __name__ == '__main__':
     # Initialize landmark detectors for each camera
     detectors = []
     for i in range(n_cameras):
-        options = mp.tasks.vision.FaceLandmarkerOptions(
+        options = mp.tasks.vision.PoseLandmarkerOptions(
             base_options=base_options,
-            output_face_blendshapes=True,
-            output_facial_transformation_matrixes=True,
+            output_segmentation_masks=False,
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            num_faces=1
         )
-        detectors.append(mp.tasks.vision.FaceLandmarker.create_from_options(options))
+        detectors.append(mp.tasks.vision.PoseLandmarker.create_from_options(options))
 
     start_time = time.time()
     
