@@ -1,5 +1,6 @@
 import time
 import threading
+from queue import Queue
 import cv2
 import numpy as np
 from typing import *
@@ -32,91 +33,165 @@ def draw_landmarks_on_image(rgb_image, detection_result):
     return annotated_image
 
 
-class Caputurer:
+class Capturer:
     """
     A multithread pipeline for capturing and detecting landmarks from multiple cameras.
     """
-    def __init__(self, max_cameras: int = 10):
-        self.cameras = []
-        for i in range(max_cameras):
-            cam = cv2.VideoCapture(i)
-            if cam.isOpened():
-                self.cameras.append(cam)
-            else:
-                cam.release()
-                break
-        self.n_cameras = len(self.cameras)
-        print(f'Found {len(self.cameras)} cameras')
+    def __init__(
+        self, 
+        video_captures: List[cv2.VideoCapture],
+        capture_face: bool = True,
+        capture_pose: bool = True,
+        capture_hands: bool = False,
+    ):
+        # VideoCaptures (cameras)
+        self.video_captures = video_captures
+        self.n_captures = len(video_captures)
+        self.queue_capture = [Queue() for _ in range(self.n_captures)]
+
+        # Detectors
+        self.capture_face = capture_face
+        if capture_face:
+            self._init_face_detectors()
+            self.queue_detect_face = [Queue() for _ in range(self.n_captures)]
+            self.queue_gather_result_face = [Queue() for _ in range(self.n_captures)]
         
-        # Initialize landmark detectors for each camera
-        self.detectors = []
-        for i in range(self.n_cameras):
+        self.capture_pose = capture_pose
+        if capture_pose:
+            self._init_pose_detectors()
+            self.queue_detect_pose = [Queue() for _ in range(self.n_captures)]
+            self.queue_gather_result_pose = [Queue() for _ in range(self.n_captures)]
+        
+        self.capture_hands = capture_hands
+        if capture_hands:
+            self._init_hand_detectors()
+            self.queue_detect_hands = [Queue() for _ in range(self.n_captures)]
+            self.queue_gather_result_hands = [Queue() for _ in range(self.n_captures)]
+
+        self.queue_gather_result_output = Queue()
+        self.barrier_capture = threading.Barrier(self.n_captures)
+    
+    def _init_face_detectors(self):
+        self.face_detectors = []
+        for i in range(self.n_captures):
+            options = mp.tasks.vision.FaceLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path='./mediapipe-assets/face_landmarker_v2_with_blendshapes.task'),
+                output_face_blendshapes=True,
+                output_facial_transformation_matrixes=True,
+                running_mode=mp.tasks.vision.RunningMode.VIDEO,
+                num_faces=1
+            )
+            detector = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+            self.face_detectors.append(detector)
+        
+    def _init_pose_detectors(self):
+        self.pose_detectors = []
+        for i in range(self.n_captures):
             options = mp.tasks.vision.PoseLandmarkerOptions(
-                base_options=base_options,
+                base_options=mp.tasks.BaseOptions(model_asset_path='./mediapipe-assets/pose_landmarker_lite.task'),
                 output_segmentation_masks=False,
                 running_mode=mp.tasks.vision.RunningMode.VIDEO,
             )
-            self.detectors.append(mp.tasks.vision.PoseLandmarker.create_from_options(options))
-
-        self.threads = []
-        self.frames, self.results = [None] * self.n_cameras, [None] * self.n_cameras
-        self.events_proceed = [threading.Event() for _ in range(self.n_cameras)]
-        self.events_ready = [threading.Event() for _ in range(self.n_cameras)]
-        self.event_exit = threading.Event()
-        self.barrier_capture = threading.Barrier(self.n_cameras)
-        for i in range(self.n_cameras):
-            thread = threading.Thread(
-                target=self._caputure_detect_thread_fn, 
-                args=(i, self.frames, self.results, self.cameras[i], self.detectors[i], self.barrier_capture, self.events_proceed[i], self.events_ready[i], self.event_exit)
-            )
-            thread.start()
-            self.threads.append(thread)
-
-    def _caputure_detect_thread_fn(
-        self,
-        idx: int, 
-        frames: List[np.ndarray], 
-        results: List[Any], 
-        cap: cv2.VideoCapture, 
-        detector: mp.tasks.vision.FaceLandmarker, 
-        barrier_grab: threading.Barrier, 
-        event_proceed: threading.Event, 
-        event_ready: threading.Event, 
-        event_exit: threading.Event
-    ):
+            detector = mp.tasks.vision.PoseLandmarker.create_from_options(options)
+            self.pose_detectors.append(detector)
+    
+    def _init_hand_detectors(self):
+        raise NotImplementedError()
+            
+    def _caputure_thread_fn(self, idx: int):
         while True:
-            event_proceed.wait()
-            event_proceed.clear()
+            flag = self.queue_capture[idx].get(block=True)
+            
+            # Synchronize cameras
+            self.barrier_capture.wait()
             frame_time = time.time()
-            if event_exit.is_set():
-                break
+            self.video_captures[idx].grab()
             
-            barrier_grab.wait()
-            cap.grab()
-            barrier_grab.wait()
-            
-            _, frame = cap.retrieve()
-            frames[idx] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results[idx] = detector.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=frames[idx]), int((frame_time - start_time) * 1000))
-            # frames[idx] = draw_landmarks_on_image(frames[idx], results[idx])
-            event_ready.set()
-            
+            _, frame = self.video_captures[idx].retrieve()
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+            frame_timestamp_ms = int((frame_time - self.start_time) * 1000)
+
+            if self.capture_face:
+                self.queue_detect_face[idx].put((mp_image, frame_timestamp_ms))
+            if self.capture_pose:
+                self.queue_detect_pose[idx].put((mp_image, frame_timestamp_ms))
+            if self.capture_hands:
+                self.queue_detect_hands[idx].put((mp_image, frame_timestamp_ms))
+    
+    def _detect_face_thread_fn(self, idx: int):
+        while True:
+            mp_image, frame_timestamp_ms = self.queue_detect_face[idx].get(block=True)
+            face_landmarker_result = self.face_detectors[idx].detect_for_video(mp_image, frame_timestamp_ms)
+            self.queue_gather_result_face[idx].put(face_landmarker_result)
+
+    def _detect_pose_thread_fn(self, idx: int):
+        while True:
+            mp_image, frame_timestamp_ms = self.queue_detect_pose[idx].get(block=True)
+            pose_landmarker_result = self.pose_detectors[idx].detect_for_video(mp_image, frame_timestamp_ms)
+            self.queue_gather_result_pose[idx].put(pose_landmarker_result)
+    
+    def _detect_hands_thread_fn(self, idx: int):
+        raise NotImplementedError()
+    
+    def _gather_result_thread_fn(self):
+        while True:
+            result = {}
+            if self.capture_face:
+                result['face'] = [self.queue_gather_result_face[i].get(block=True) for i in range(self.n_captures)]
+            if self.capture_pose:
+                result['pose'] = [self.queue_gather_result_pose[i].get(block=True) for i in range(self.n_captures)]
+            if self.capture_hands:
+                result['hands'] = [self.queue_gather_result_hands[i].get(block=True) for i in range(self.n_captures)]
+            self.queue_gather_result_output.put(result)
+
     def start(self):
         self.start_time = time.time()
         self.cnt_frames = 0
+
         # A hack to synchronize the start of the cameras
         for _ in range(10):
-            for cam in self.cameras:
+            for cam in self.video_captures:
                 cam.grab()
 
-    def capture(self):
-        # Proceed next frame
-        for i in range(self.n_cameras):
-            self.events_proceed[i].set()
-        # Wait for all frames to be ready
-        for i in range(self.n_cameras):
-            self.events_ready[i].wait()
-            self.events_ready[i].clear()
+        self.thread_capture = []
+        for i in range(self.n_captures):
+            thread = threading.Thread(target=self._caputure_thread_fn, args=(i,))
+            thread.start()
+            self.thread_capture.append(thread)
+        
+        if self.capture_face:
+            self.thread_detect_face = []
+            for i in range(self.n_captures):
+                thread = threading.Thread(target=self._detect_face_thread_fn, args=(i,))
+                thread.start()
+                self.thread_detect_face.append(thread)
+        
+        if self.capture_pose:
+            self.thread_detect_pose = []
+            for i in range(self.n_captures):
+                thread = threading.Thread(target=self._detect_pose_thread_fn, args=(i,))
+                thread.start()
+                self.thread_detect_pose.append(thread)
+        
+        if self.capture_hands:
+            self.thread_detect_hands = []
+            for i in range(self.n_captures):
+                thread = threading.Thread(target=self._detect_hands_thread_fn, args=(i,))
+                thread.start()
+                self.thread_detect_hands.append(thread)
+        
+        self.thread_gather_result = threading.Thread(target=self._gather_result_thread_fn)
+        self.thread_gather_result.start()
+
+    def next_frame(self):
+        self.cnt_frames += 1
+        for i in range(self.n_captures):
+            self.queue_capture[i].put(True)
+
+    def get_result(self):
+        return self.queue_gather_result_output.get(block=True)
+
 
 if __name__ == '__main__':
     base_options = mp.tasks.BaseOptions(model_asset_path='./mediapipe-assets/pose_landmarker_lite.task')

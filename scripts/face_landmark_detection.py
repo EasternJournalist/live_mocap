@@ -80,8 +80,6 @@ def caputure_detect_thread_fn(
 if __name__ == '__main__':
     # Create an FaceLandmarker object.
     # !wget -O face_landmarker_v2_with_blendshapes.task -q https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
-    base_options = mp.tasks.BaseOptions(model_asset_path='./mediapipe-assets/face_landmarker_v2_with_blendshapes.task')
-
     # Open video capture devices
     MAX_CAMERAS = 2
     cameras = []
@@ -99,7 +97,7 @@ if __name__ == '__main__':
     detectors = []
     for i in range(n_cameras):
         options = mp.tasks.vision.FaceLandmarkerOptions(
-            base_options=base_options,
+            base_options=mp.tasks.BaseOptions(model_asset_path='./mediapipe-assets/face_landmarker_v2_with_blendshapes.task'),
             output_face_blendshapes=True,
             output_facial_transformation_matrixes=True,
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
